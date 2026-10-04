@@ -4,7 +4,7 @@
   "private": true,
   "description": "PulseBoard project risk and delivery workspace",
   "engines": {
-    "node": ">=18"
+    "node": ">=18 <25"
   },
   "scripts": {
     "start": "node server.js",

@@ -9,6 +9,7 @@ const { promisify } = require("node:util");
 const scrypt = promisify(crypto.scrypt);
 const SESSION_COOKIE = "pulseboard_session";
 const SESSION_TTL = 1000 * 60 * 60 * 24 * 7;
+const SESSION_SECRET = process.env.SESSION_SECRET || "pulseboard-demo-secret-change-this-in-vercel";
 const MAX_BODY_BYTES = 1024 * 1024;
 const ROLES = new Set(["ADMIN", "MEMBER", "VIEWER"]);
 
@@ -26,6 +27,17 @@ function safeEqual(left, right) {
   const a = Buffer.from(String(left));
   const b = Buffer.from(String(right));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function encodeSession(session) {
+  const payload = Buffer.from(JSON.stringify(session)).toString("base64url");
+  const signature = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function cookieHeader(token, request, maxAge = SESSION_TTL / 1000) {
+  const secure = process.env.VERCEL || request.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
+  return `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure}`;
 }
 
 function cleanProject(project) {
@@ -250,11 +262,12 @@ function withoutDerivedTaskFields(task) {
 
 function createApp(options = {}) {
   const root = __dirname;
-  const dataDirectory = options.dataDirectory || process.env.PULSEBOARD_DATA_DIR || path.join(root, ".pulseboard-data");
+  const dataDirectory = options.dataDirectory || process.env.PULSEBOARD_DATA_DIR ||
+    (process.env.VERCEL ? path.join("/tmp", "pulseboard-data") : path.join(root, ".pulseboard-data"));
   const seedPath = path.join(root, "data", "seed.json");
   const usersPath = path.join(dataDirectory, "users.json");
   const projectPath = path.join(dataDirectory, "project.json");
-  const sessions = new Map();
+  const suppliedSeed = options.seedData || null;
   const eventStreams = new Set();
   let revision = 1;
   let project;
@@ -285,7 +298,7 @@ function createApp(options = {}) {
 
   async function initialize() {
     fs.mkdirSync(dataDirectory, { recursive: true });
-    const seed = readJson(seedPath, null);
+    const seed = suppliedSeed || readJson(seedPath, null);
     if (!seed) throw new Error(`Could not read the seed data at ${seedPath}`);
     const rawProject = readJson(projectPath, null);
     try {
@@ -345,13 +358,15 @@ function createApp(options = {}) {
     const cookie = request.headers.cookie || "";
     const match = cookie.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
     if (!match) return null;
-    const session = sessions.get(match[1]);
-    if (!session || session.expiresAt < Date.now()) {
-      sessions.delete(match[1]);
-      return null;
-    }
-    session.expiresAt = Date.now() + SESSION_TTL;
-    return session;
+    const [payload, signature] = match[1].split(".");
+    if (!payload || !signature) return null;
+    const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+    if (!safeEqual(signature, expected)) return null;
+    try {
+      const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+      if (!session || session.expiresAt < Date.now() || !ROLES.has(session.role) || !session.csrfToken) return null;
+      return session;
+    } catch { return null; }
   }
 
   function requireSession(request, response) {
@@ -382,6 +397,18 @@ function createApp(options = {}) {
   }
 
   async function readBody(request) {
+    if (request.body !== undefined) {
+      try {
+        const parsed = request.body;
+        if (parsed && typeof parsed === "object" && !Buffer.isBuffer(parsed) && !Array.isArray(parsed)) return parsed;
+        const text = Buffer.isBuffer(parsed) ? parsed.toString("utf8") : String(parsed || "{}");
+        const value = JSON.parse(text);
+        if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("JSON object required.");
+        return value;
+      } catch {
+        throw Object.assign(new Error("Request body must be valid JSON."), { statusCode: 400 });
+      }
+    }
     const chunks = [];
     let bytes = 0;
     for await (const chunk of request) {
@@ -465,7 +492,7 @@ function createApp(options = {}) {
         return;
       }
       if (request.method === "GET" && pathname === "/api/seed") {
-        const seed = readJson(seedPath, null);
+        const seed = suppliedSeed || readJson(seedPath, null);
         sendJson(response, 200, seed);
         return;
       }
@@ -485,10 +512,8 @@ function createApp(options = {}) {
           sendJson(response, 401, { error: "Email or password is incorrect." });
           return;
         }
-        const token = crypto.randomBytes(32).toString("hex");
         const session = { name: user.name, email: user.email, role: user.role, csrfToken: crypto.randomBytes(24).toString("hex"), expiresAt: Date.now() + SESSION_TTL };
-        sessions.set(token, session);
-        sendJson(response, 200, { user: sessionUser(session) }, { "Set-Cookie": `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL / 1000}` });
+        sendJson(response, 200, { user: sessionUser(session) }, { "Set-Cookie": cookieHeader(encodeSession(session), request) });
         return;
       }
       if (request.method === "POST" && pathname === "/api/auth/register") {
@@ -512,10 +537,8 @@ function createApp(options = {}) {
         const user = { name, email, role: "MEMBER", passwordSalt: passwordHash.salt, passwordHash: passwordHash.hash };
         users.push(user);
         writeJsonAtomic(usersPath, users);
-        const token = crypto.randomBytes(32).toString("hex");
         const session = { name, email, role: "MEMBER", csrfToken: crypto.randomBytes(24).toString("hex"), expiresAt: Date.now() + SESSION_TTL };
-        sessions.set(token, session);
-        sendJson(response, 201, { user: sessionUser(session) }, { "Set-Cookie": `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL / 1000}` });
+        sendJson(response, 201, { user: sessionUser(session) }, { "Set-Cookie": cookieHeader(encodeSession(session), request) });
         return;
       }
       if (request.method === "GET" && pathname === "/api/auth/me") {
@@ -527,10 +550,7 @@ function createApp(options = {}) {
         const session = requireSession(request, response);
         if (!session || !requireCsrf(request, response, session)) return;
         await readBody(request);
-        const cookie = request.headers.cookie || "";
-        const token = cookie.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`))?.[1];
-        if (token) sessions.delete(token);
-        sendJson(response, 200, { ok: true }, { "Set-Cookie": `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` });
+        sendJson(response, 200, { ok: true }, { "Set-Cookie": cookieHeader("", request, 0) });
         return;
       }
       if (request.method === "GET" && pathname === "/api/project") {
@@ -555,7 +575,7 @@ function createApp(options = {}) {
           sendJson(response, 400, { error: "A valid project payload is required." });
           return;
         }
-        const seed = readJson(seedPath, null);
+        const seed = suppliedSeed || readJson(seedPath, null);
         const today = body.today ?? seed?.today;
         if (!Number.isInteger(today) || today < 0 || today > 365) {
           sendJson(response, 400, { error: "Forecast day must be an integer from 0 to 365." });
@@ -610,6 +630,11 @@ function createApp(options = {}) {
         fs.createReadStream(path.join(root, "index.html")).pipe(response);
         return;
       }
+      if (request.method === "GET" && (pathname === "/favicon.ico" || pathname === "/favicon.png")) {
+        response.writeHead(204, { "Cache-Control": "public, max-age=86400" });
+        response.end();
+        return;
+      }
       sendJson(response, 404, { error: "Not found." });
     } catch (error) {
       if (!response.headersSent) sendJson(response, error.statusCode || 500, { error: error.statusCode ? error.message : "The server could not complete this request." });
@@ -638,4 +663,37 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createApp, runForecast, descopeDescendants };
+function createVercelHandler(options = {}) {
+  let appPromise;
+  return async function vercelHandler(request, response) {
+    try {
+      const rewrittenPath = request.query && request.query.__path;
+      if (typeof rewrittenPath === "string" && rewrittenPath.startsWith("/")) {
+        const incoming = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+        incoming.searchParams.delete("__path");
+        const query = incoming.searchParams.toString();
+        request.url = `${rewrittenPath}${query ? `?${query}` : ""}`;
+      }
+      if (!appPromise) {
+        const app = createApp(options);
+        appPromise = app.initialize().then(() => app);
+      }
+      const app = await appPromise;
+      const listener = app.listeners("request")[0];
+      listener(request, response);
+    } catch (error) {
+      if (!response.headersSent) {
+        response.writeHead(500, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+        response.end(JSON.stringify({ error: "PulseBoard could not initialize." }));
+      } else response.destroy(error);
+    }
+  };
+}
+
+const vercelHandler = createVercelHandler();
+
+module.exports = vercelHandler;
+module.exports.createApp = createApp;
+module.exports.runForecast = runForecast;
+module.exports.descopeDescendants = descopeDescendants;
+module.exports.createVercelHandler = createVercelHandler;

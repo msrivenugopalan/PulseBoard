@@ -76,4 +76,17 @@ The server binds to `127.0.0.1` by default. Set `HOST=0.0.0.0` and `PORT` when r
 
 ## Deployment scope
 
-This is a single-process hackathon deployment. Project writes use atomic JSON replacement, sessions are kept in process memory, and forecast runs synchronously on the Node event loop. Keep public deployments behind HTTPS and add durable shared storage before scaling out.
+This is a single-process hackathon deployment. Locally, JSON writes use atomic replacement under `.pulseboard-data/`. Vercel uses `/tmp/pulseboard-data`, which is writable but ephemeral and isolated per serverless instance; project updates can be lost on cold starts and are not shared across scaled instances. Sessions use signed, HttpOnly cookies and require the same `SESSION_SECRET` across deployments. SSE reconnects when a function instance closes, but cross-instance live updates and durable project storage require shared services. Use a database/object store plus shared pub/sub before relying on a public multi-instance deployment.
+
+## Deploy to Vercel
+
+The root `server.js` and `api/index.js` both expose callable Node handlers. `vercel.json` explicitly builds `api/index.js` as a Node function and `index.html` as a static asset; this avoids Vercel treating the root server module as a function with an invalid export. The adapter imports the canonical seed JSON into the function bundle.
+
+Import this repository into Vercel, set the Framework Preset to **Other**, add a high-entropy `SESSION_SECRET` for Preview and Production, and deploy. Do not use the default demo secret for a public deployment. To reproduce the tested build locally and deploy its output:
+
+```sh
+vercel build --project pulse-board --yes
+vercel deploy --prebuilt --prod --project pulse-board
+```
+
+The explicit `builds` setting takes precedence over Vercel dashboard Build/Development settings. Use the repository's `vercel.json` routing/build configuration.

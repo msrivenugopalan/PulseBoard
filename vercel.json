@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "builds": [
+    {
+      "src": "api/index.js",
+      "use": "@vercel/node",
+      "config": {
+        "includeFiles": "{server.js,index.html,data/seed.json}"
+      }
+    },
+    {
+      "src": "index.html",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    { "handle": "filesystem" },
+    { "src": "^/api(?:/(.*))?$", "dest": "/api/index.js?__path=/api/$1" },
+    { "src": "^/$", "dest": "/api/index.js?__path=/" },
+    { "src": "^(?:/(.*))$", "dest": "/api/index.js?__path=/$1" },
+    { "handle": "error" }
+  ]
+}

@@ -2,10 +2,11 @@
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { createApp, runForecast } = require("../server");
+const { createApp, createVercelHandler, runForecast } = require("../server");
 
 function seededRandom(seed) {
   let value = seed >>> 0;
@@ -222,4 +223,31 @@ test("corrupt runtime JSON is backed up and reseeded", async () => {
   } finally {
     fs.rmSync(dataDirectory, { recursive: true, force: true });
   }
+});
+
+test("Vercel adapter exports a handler and restores rewritten API and root paths", async t => {
+  const dataDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pulseboard-vercel-test-"));
+  const handler = createVercelHandler({ dataDirectory });
+  const server = http.createServer((request, response) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    request.query = { __path: url.searchParams.get("__path") };
+    void handler(request, response);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    await new Promise(resolve => server.close(resolve));
+    fs.rmSync(dataDirectory, { recursive: true, force: true });
+  });
+
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const health = await fetch(`${base}/api/index?__path=%2Fapi%2Fhealth`);
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).ok, true);
+  const home = await fetch(`${base}/api/index?__path=%2F`);
+  assert.equal(home.status, 200);
+  assert.match(await home.text(), /PulseBoard/);
+  assert.equal((await fetch(`${base}/api/index?__path=%2Ffavicon.ico`)).status, 204);
+  assert.equal((await fetch(`${base}/api/index?__path=%2Ffavicon.png`)).status, 204);
+  assert.equal(typeof require("../api"), "function");
+  assert.equal(typeof require("../server"), "function");
 });
